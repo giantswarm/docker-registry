@@ -27,4 +27,4 @@ EXPOSE 5000
 
 WORKDIR /docker-registry
 
-CMD exec docker-registry
+CMD . ./fix_docker_link_env && exec docker-registry
