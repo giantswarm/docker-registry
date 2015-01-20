@@ -1,82 +1,88 @@
+# -*- coding: utf-8 -*-
+
 import logging
 import logging.handlers
-import os
-
-try:
-    import bugsnag
-    import bugsnag.flask
-except ImportError as e:
-    _bugsnag_import_error = e
-    bugsnag = None
-import flask
+import platform
+import sys
 
 from . import toolkit
+from .extras import cors
+from .extras import ebugsnag
 from .lib import config
+from .server import __version__
+import flask
 
-
-VERSION = '0.6.9'
-app = flask.Flask('docker-registry')
+# configure logging prior to subsequent imports which assume
+# logging has been configured
 cfg = config.load()
-loglevel = getattr(logging, cfg.get('loglevel', 'INFO').upper())
 logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s',
-                    level=loglevel)
+                    level=getattr(logging, cfg.loglevel.upper()),
+                    datefmt="%d/%b/%Y:%H:%M:%S %z")
+
+from .lib import mirroring  # noqa
+
+app = flask.Flask('docker-registry')
 
 
 @app.route('/_ping')
 @app.route('/v1/_ping')
 def ping():
-    return toolkit.response(headers={
-        'X-Docker-Registry-Standalone': cfg.standalone is not False
-    })
+    headers = {
+        'X-Docker-Registry-Standalone': 'mirror' if mirroring.is_mirror()
+                                        else (cfg.standalone is True)
+    }
+    infos = {}
+    if cfg.debug:
+        # Versions
+        versions = infos['versions'] = {}
+        headers['X-Docker-Registry-Config'] = cfg.flavor
+
+        for name, module in sys.modules.items():
+            if name.startswith('_'):
+                continue
+            try:
+                version = module.__version__
+            except AttributeError:
+                continue
+            versions[name] = version
+        versions['python'] = sys.version
+
+        # Hosts infos
+        infos['host'] = platform.uname()
+        infos['launch'] = sys.argv
+
+    return toolkit.response(infos, headers=headers)
 
 
 @app.route('/')
 def root():
-    return toolkit.response('docker-registry server ({0}) (v{1})'
-                            .format(cfg.flavor, VERSION))
-
-
-@app.after_request
-def after_request(response):
-    response.headers['X-Docker-Registry-Version'] = VERSION
-    response.headers['X-Docker-Registry-Config'] = cfg.flavor
-    return response
+    return toolkit.response(cfg.issue)
 
 
 def init():
     # Configure the email exceptions
     info = cfg.email_exceptions
-    if info and 'smtp_host' in info:
-        mailhost = info['smtp_host']
-        mailport = info.get('smtp_port')
+    if info and info.smtp_host:
+        mailhost = info.smtp_host
+        mailport = info.smtp_port
         if mailport:
             mailhost = (mailhost, mailport)
-        smtp_secure = info.get('smtp_secure', None)
+        smtp_secure = info.smtp_secure
         secure_args = _adapt_smtp_secure(smtp_secure)
         mail_handler = logging.handlers.SMTPHandler(
             mailhost=mailhost,
-            fromaddr=info['from_addr'],
-            toaddrs=[info['to_addr']],
+            fromaddr=info.from_addr,
+            toaddrs=[info.to_addr],
             subject='Docker registry exception',
-            credentials=(info['smtp_login'],
-                         info['smtp_password']),
+            credentials=(info.smtp_login,
+                         info.smtp_password),
             secure=secure_args)
         mail_handler.setLevel(logging.ERROR)
         app.logger.addHandler(mail_handler)
-    # Configure bugsnag
-    info = cfg.bugsnag
-    if info:
-        if not bugsnag:
-            raise _bugsnag_import_error
-        root_path = os.path.abspath(os.path.join(os.path.dirname(__file__),
-                                                 '..'))
-        bugsnag.configure(api_key=info,
-                          project_root=root_path,
-                          release_stage=cfg.flavor,
-                          notify_release_stages=[cfg.flavor],
-                          app_version=VERSION
-                          )
-        bugsnag.flask.handle_exceptions(app)
+    # Optional bugsnag support
+    ebugsnag.boot(app, cfg.bugsnag, cfg.flavor, __version__)
+    # Optional cors support
+    cors.boot(app, cfg.cors)
 
 
 def _adapt_smtp_secure(value):
@@ -89,9 +95,9 @@ def _adapt_smtp_secure(value):
     if isinstance(value, basestring):
         # a string - wrap it in the tuple
         return (value,)
-    if isinstance(value, dict):
+    if isinstance(value, config.Config):
         assert set(value.keys()) <= set(['keyfile', 'certfile'])
-        return (value['keyfile'], value.get('certfile', None))
+        return (value.keyfile, value.certfile)
     if value:
         return ()
 

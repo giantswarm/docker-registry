@@ -4,8 +4,9 @@ import datetime
 import json
 import logging
 import re
-import redis
 import sys
+
+import redis
 
 logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s',
                     level=logging.INFO)
@@ -19,14 +20,14 @@ logging_period = 60 * 24  # 24hs
 logging_interval = 15  # 15 minutes
 exp_time = 60 * 60 * 24  # Key expires in 24hs
 try:
-    with open('/home/dotcloud/environment.json') as f:
+    with open('/home/docker/environment.json') as f:
         env = json.load(f)
         # Prod
         redis_opts = {
-            'host': env['DOTCLOUD_REDIS_REDIS_HOST'],
-            'port': int(env['DOTCLOUD_REDIS_REDIS_PORT']),
+            'host': env['REDIS_HOST'],
+            'port': int(env['REDIS_PORT']),
             'db': 1,
-            'password': env['DOTCLOUD_REDIS_REDIS_PASSWORD'],
+            'password': env['REDIS_PASSWORD'],
         }
 except Exception:
     # Dev
@@ -213,20 +214,21 @@ def generate_bandwidth_data(start_time, min_time, time_interval):
                                    num_items)
                     if not most_recent_parsing:
                         most_recent_parsing = str_end_time
-                    time_interval, items = \
+                    time_interval, items = (
                         update_current_interval(items,
                                                 logging_interval,
                                                 start_time)
+                    )
                 else:
-                    time_interval, items = \
+                    time_interval, items = (
                         adjust_current_interval(time_interval,
                                                 end_time,
                                                 items)
-            bandwidth_items[time_interval] = \
-                bandwidth_items.get(time_interval, 0.0) \
-                + bandwidth
-            num_items[time_interval] = \
-                num_items.get(time_interval, 0.0) + 1
+                    )
+            bandwidth_items[time_interval] = (
+                bandwidth_items.get(time_interval, 0.0) + bandwidth
+            )
+            num_items[time_interval] = num_items.get(time_interval, 0.0) + 1
             end_times.pop(key, None)
     if most_recent_parsing:
         save_last_line_parsed(most_recent_parsing)

@@ -1,7 +1,10 @@
+# -*- coding: utf-8 -*-
+
 # https://gist.github.com/adewes/6103220
 
-import redis
 import time
+
+import redis
 
 
 class LockTimeout(BaseException):
@@ -40,7 +43,7 @@ class Lock(object):
                 self.owns_lock = True
                 return expires
             except redis.WatchError:
-                print "Someone tinkered with the lock!"
+                print("Someone tinkered with the lock!")
                 pass
 
     def __exit__(self, exc_type, exc_value, traceback):

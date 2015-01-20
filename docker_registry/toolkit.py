@@ -1,37 +1,62 @@
+# -*- coding: utf-8 -*-
+
 import base64
-import distutils.version
 import functools
+import hashlib
 import logging
+import os
 import random
 import re
 import string
+import time
 import urllib
 
 import flask
+from M2Crypto import RSA
 import requests
-import rsa
-import simplejson as json
+
+from docker_registry.core import compat
+json = compat.json
 
 from . import storage
 from .lib import config
 
+cfg = config.load()
 
 logger = logging.getLogger(__name__)
 _re_docker_version = re.compile('docker/([^\s]+)')
 _re_authorization = re.compile(r'(\w+)[:=][\s"]?([^",]+)"?')
+_re_hex_image_id = re.compile(r'^([a-f0-9]{16}|[a-f0-9]{64})$')
 
 
-class DockerVersion(distutils.version.StrictVersion):
+def valid_image_id(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        image_id = kwargs.get('image_id', '')
+        if _re_hex_image_id.match(image_id):
+            return f(*args, **kwargs)
+        return api_error("Invalid image ID", 404)
+    return wrapper
 
-    def __init__(self):
-        ua = flask.request.headers.get('user-agent', '')
-        m = _re_docker_version.search(ua)
-        if not m:
-            raise RuntimeError('toolkit.DockerVersion: cannot parse version')
-        version = m.group(1)
-        if '-' in version:
-            version = version.split('-')[0]
-        distutils.version.StrictVersion.__init__(self, version)
+
+def docker_client_version():
+    """Try and extract the client version from the User-Agent string
+
+    So we can warn older versions of the Docker engine/daemon about
+    incompatible APIs.  If we can't figure out the version (e.g. the
+    client is not a Docker engine), just return None.
+    """
+    ua = flask.request.headers.get('user-agent', '')
+    m = _re_docker_version.search(ua)
+    if not m:
+        return
+    version = m.group(1)
+    if '-' in version:
+        version = version.split('-')[0]
+    try:
+        return tuple(int(x) for x in version)
+    except ValueError:
+        return
 
 
 class SocketReader(object):
@@ -48,14 +73,12 @@ class SocketReader(object):
             if chunk_size == -1:
                 chunk_size = 1024
             for chunk in self._fp.iter_content(chunk_size):
-                logger.debug('Read %d bytes' % len(chunk))
                 for handler in self.handlers:
                     handler(chunk)
                 yield chunk
         else:
             chunk = self._fp.read(chunk_size)
             while chunk:
-                logger.debug('Read %d bytes' % len(chunk))
                 for handler in self.handlers:
                     handler(chunk)
                 yield chunk
@@ -78,12 +101,15 @@ def response(data=None, code=200, headers=None, raw=False):
         data = True
     h = {
         'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
         'Expires': '-1',
         'Content-Type': 'application/json'
     }
     if headers:
         h.update(headers)
+
+    if h['Cache-Control'] == 'no-cache':
+        h['Pragma'] = 'no-cache'
+
     try:
         if raw is False:
             data = json.dumps(data, sort_keys=True, skipkeys=True)
@@ -93,8 +119,7 @@ def response(data=None, code=200, headers=None, raw=False):
 
 
 def validate_parent_access(parent_id):
-    cfg = config.load()
-    if cfg.standalone is not False:
+    if cfg.standalone:
         return True
     auth = _parse_auth_header()
     if not auth:
@@ -103,12 +128,8 @@ def validate_parent_access(parent_id):
     if len(full_repos_name) != 2:
         logger.debug('validate_parent: Invalid repository field')
         return False
-    index_endpoint = cfg.index_endpoint
-    if index_endpoint is None:
-        index_endpoint = 'https://index.docker.io'
-    index_endpoint = index_endpoint.strip('/')
     url = '{0}/v1/repositories/{1}/{2}/layer/{3}/access'.format(
-        index_endpoint, full_repos_name[0], full_repos_name[1], parent_id
+        cfg.index_endpoint, full_repos_name[0], full_repos_name[1], parent_id
     )
     headers = {'Authorization': flask.request.headers.get('authorization')}
     resp = requests.get(url, verify=True, headers=headers)
@@ -118,9 +139,10 @@ def validate_parent_access(parent_id):
         ))
         return False
     try:
+        # Note(dmp): unicode patch XXX not applied! Assuming requests does it
         logger.debug('validate_parent: Content: {0}'.format(resp.text))
         return json.loads(resp.text).get('access', False)
-    except json.JSONDecodeError:
+    except ValueError:
         logger.debug('validate_parent: Wrong response format')
         return False
 
@@ -130,12 +152,7 @@ def validate_token(auth):
     if len(full_repos_name) != 2:
         logger.debug('validate_token: Invalid repository field')
         return False
-    cfg = config.load()
-    index_endpoint = cfg.index_endpoint
-    if index_endpoint is None:
-        index_endpoint = 'https://index.docker.io'
-    index_endpoint = index_endpoint.strip('/')
-    url = '{0}/v1/repositories/{1}/{2}/images'.format(index_endpoint,
+    url = '{0}/v1/repositories/{1}/{2}/images'.format(cfg.index_endpoint,
                                                       full_repos_name[0],
                                                       full_repos_name[1])
     headers = {'Authorization': flask.request.headers.get('authorization')}
@@ -145,10 +162,11 @@ def validate_token(auth):
         return False
     store = storage.load()
     try:
+        # Note(dmp): unicode patch XXX not applied (requests)
         images_list = [i['id'] for i in json.loads(resp.text)]
         store.put_content(store.images_list_path(*full_repos_name),
                           json.dumps(images_list))
-    except json.JSONDecodeError:
+    except ValueError:
         logger.debug('validate_token: Wrong format for images_list')
         return False
     return True
@@ -164,8 +182,9 @@ def get_remote_ip():
 
 def is_ssl():
     for header in ('X-Forwarded-Proto', 'X-Forwarded-Protocol'):
-        if header in flask.request.headers and \
-                flask.request.headers[header].lower() in ('https', 'ssl'):
+        if header in flask.request.headers and (
+                flask.request.headers[header].lower() in ('https', 'ssl')
+        ):
                     return True
     return False
 
@@ -182,10 +201,9 @@ def _parse_auth_header():
 
 
 def check_token(args):
-    cfg = config.load()
-    if cfg.disable_token_auth is True or cfg.standalone is not False:
-        return True
     logger.debug('args = {0}'.format(args))
+    if cfg.disable_token_auth is True or cfg.standalone is True:
+        return True
     auth = _parse_auth_header()
     if not auth:
         return False
@@ -217,8 +235,8 @@ def check_token(args):
 
 
 def check_signature():
-    cfg = config.load()
-    if not cfg.get('privileged_key'):
+    pkey = cfg.privileged_key
+    if not pkey:
         return False
     headers = flask.request.headers
     signature = headers.get('X-Signature')
@@ -235,8 +253,9 @@ def check_signature():
                        ['{}:{}'.format(k, headers[k]) for k in header_keys])
     logger.debug('Signed message: {}'.format(message))
     try:
-        return rsa.verify(message, sigdata, cfg.get('privileged_key'))
-    except rsa.VerificationError:
+        return pkey.verify(message_digest(message), sigdata, 'sha1')
+    except RSA.RSAError as e:
+        logger.exception(e)
         return False
 
 
@@ -246,6 +265,12 @@ def parse_content_signature(s):
     for k, v in lst:
         ret[k] = v
     return ret
+
+
+def message_digest(s):
+    m = hashlib.new('sha1')
+    m.update(s)
+    return m.digest()
 
 
 def requires_auth(f):
@@ -278,7 +303,32 @@ def parse_repository_name(f):
         else:
             (namespace, repository) = parts
         repository = urllib.quote_plus(repository)
-        return f(namespace, repository, *args, **kwargs)
+        return f(namespace=namespace, repository=repository, *args, **kwargs)
+    return wrapper
+
+
+def exclusive_lock(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        lock_path = os.path.join(
+            './', 'registry.{0}.lock'.format(f.func_name)
+        )
+        if os.path.exists(lock_path):
+            x = 0
+            while os.path.exists(lock_path) and x < 100:
+                logger.warn('Another process is creating the search database')
+                x += 1
+                time.sleep(1)
+            if x == 100:
+                raise Exception('Timedout waiting for db init')
+            return
+        lock_file = open(lock_path, 'w')
+        lock_file.close()
+        try:
+            result = f(*args, **kwargs)
+        finally:
+            os.remove(lock_path)
+        return result
     return wrapper
 
 
@@ -294,3 +344,11 @@ def get_repository():
     if len(parts) < 2:
         return ('library', parts[0])
     return (parts[0], parts[1])
+
+
+def get_endpoints(overcfg=None):
+    registry_endpoints = (overcfg or cfg).registry_endpoints
+    if not registry_endpoints:
+        # registry_endpoints = socket.gethostname()
+        registry_endpoints = flask.request.environ['HTTP_HOST']
+    return registry_endpoints

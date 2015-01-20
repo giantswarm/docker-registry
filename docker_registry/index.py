@@ -1,20 +1,20 @@
-import logging
+# -*- coding: utf-8 -*-
 
 import flask
-import flask_cors
-import simplejson as json
+
+from docker_registry.core import compat
+from docker_registry.core import exceptions
+json = compat.json
 
 from . import storage
 from . import toolkit
-from .lib import config
 from .lib import mirroring
 from .lib import signals
 
-from .app import app
+from .app import app  # noqa
 
 
 store = storage.load()
-logger = logging.getLogger(__name__)
 
 """Those routes are loaded only when `standalone' is enabled in the config
    file. The goal is to make the Registry working without the central Index
@@ -23,18 +23,8 @@ logger = logging.getLogger(__name__)
 """
 
 
-def get_endpoints(cfg=None):
-    if not cfg:
-        cfg = config.load()
-    registry_endpoints = cfg.registry_endpoints
-    if not registry_endpoints:
-        #registry_endpoints = socket.gethostname()
-        registry_endpoints = flask.request.environ['HTTP_HOST']
-    return registry_endpoints
-
-
 def generate_headers(namespace, repository, access):
-    registry_endpoints = get_endpoints()
+    registry_endpoints = toolkit.get_endpoints()
     # The token generated will be invalid against a real Index behind.
     token = 'Token signature={0},repository="{1}/{2}",access={3}'.format(
             toolkit.gen_random_string(), namespace, repository, access)
@@ -49,8 +39,9 @@ def get_post_users():
     if flask.request.method == 'GET':
         return toolkit.response('OK', 200)
     try:
-        json.loads(flask.request.data)
-    except json.JSONDecodeError:
+        # Note(dmp): unicode patch
+        json.loads(flask.request.data.decode('utf8'))
+    except ValueError:
         return toolkit.api_error('Error Decoding JSON', 400)
     return toolkit.response('User Created', 201)
 
@@ -60,12 +51,13 @@ def put_username(username):
     return toolkit.response('', 204)
 
 
-def update_index_images(namespace, repository, data):
+def update_index_images(namespace, repository, data_arg):
     path = store.index_images_path(namespace, repository)
     sender = flask.current_app._get_current_object()
     try:
         images = {}
-        data = json.loads(data) + json.loads(store.get_content(path))
+        # Note(dmp): unicode patch
+        data = json.loads(data_arg.decode('utf8')) + store.get_json(path)
         for i in data:
             iid = i['id']
             if iid in images and 'checksum' in images[iid]:
@@ -76,14 +68,16 @@ def update_index_images(namespace, repository, data):
                     i_data[key] = i[key]
             images[iid] = i_data
         data = images.values()
-        store.put_content(path, json.dumps(data))
+        # Note(dmp): unicode patch
+        store.put_json(path, data)
         signals.repository_updated.send(
             sender, namespace=namespace, repository=repository, value=data)
-    except IOError:
+    except exceptions.FileNotFoundError:
         signals.repository_created.send(
             sender, namespace=namespace, repository=repository,
-            value=json.loads(data))
-        store.put_content(path, data)
+            # Note(dmp): unicode patch
+            value=json.loads(data_arg.decode('utf8')))
+        store.put_content(path, data_arg)
 
 
 @app.route('/v1/repositories/<path:repository>', methods=['PUT'])
@@ -95,8 +89,9 @@ def update_index_images(namespace, repository, data):
 def put_repository(namespace, repository, images=False):
     data = None
     try:
-        data = json.loads(flask.request.data)
-    except json.JSONDecodeError:
+        # Note(dmp): unicode patch
+        data = json.loads(flask.request.data.decode('utf8'))
+    except ValueError:
         return toolkit.api_error('Error Decoding JSON', 400)
     if not isinstance(data, list):
         return toolkit.api_error('Invalid data')
@@ -107,7 +102,6 @@ def put_repository(namespace, repository, images=False):
 
 
 @app.route('/v1/repositories/<path:repository>/images', methods=['GET'])
-@flask_cors.cross_origin(methods=['GET'])  # allow all origins (*)
 @toolkit.parse_repository_name
 @toolkit.requires_auth
 @mirroring.source_lookup(index_route=True)
@@ -116,7 +110,7 @@ def get_repository_images(namespace, repository):
     try:
         path = store.index_images_path(namespace, repository)
         data = store.get_content(path)
-    except IOError:
+    except exceptions.FileNotFoundError:
         return toolkit.api_error('images not found', 404)
     headers = generate_headers(namespace, repository, 'read')
     return toolkit.response(data, 200, headers, True)

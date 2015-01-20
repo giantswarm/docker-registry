@@ -1,98 +1,139 @@
+# -*- coding: utf-8 -*-
 
 import os
-import rsa
+
+from M2Crypto import BIO
+from M2Crypto import RSA
 import yaml
 
-from .core.exceptions import ConfigError
-from .core.exceptions import FileNotFoundError
+from docker_registry.core import compat
+from docker_registry.core import exceptions
 
 
 class Config(object):
+    """A simple config class
 
-    def __init__(self, config):
-        self._config = config
+     * gives properties access through either items or attributes
+     * enforce types (thanks to yaml)
+     * interpolate from ENV
+    """
+
+    def __init__(self, config=None):
+        if config is None:
+            config = {}
+        if isinstance(config, compat.basestring):
+            try:
+                self._config = yaml.load(config)
+            except Exception as e:
+                # Failed yaml loading? Stop here!
+                raise exceptions.ConfigError(
+                    'Config is not valid yaml (%s): \n%s' % (e, config))
+        else:
+            # Config is kept as-is...
+            self._config = config
 
     def __repr__(self):
         return repr(self._config)
 
+    def __dir__(self):
+        return self._config.keys()
+
+    def keys(self):
+        return self._config.keys()
+
+    # Python 2.6 and below need this
+    @property
+    def __members__(self):
+        return self._config.keys()
+
+    @property
+    def __methods__(self):
+        return []
+
     def __getattr__(self, key):
-        if key in self._config:
-            return self._config[key]
+        # Unset keys return None
+        if key not in self._config:
+            return None
+            # raise exceptions.ConfigError("No such attribute: %s" % key)
+        result = self._config[key]
+        # Strings starting with `_env:' get evaluated
+        if isinstance(
+                result, compat.basestring) and result.startswith('_env:'):
+            result = result.split(':', 2)
+            varname = result[1]
+            vardefault = '' if len(result) < 3 else result[2]
+            try:
+                result = yaml.load(os.environ.get(varname, vardefault))
+            except Exception as e:
+                raise exceptions.ConfigError(
+                    'Config `%s` (value: `%s`) is not valid: %s' % (
+                        varname, e, result))
+        # Dicts are rewrapped inside a Config object
+        if isinstance(result, dict):
+            result = Config(result)
+        return result
 
-    def get(self, *args, **kwargs):
-        return self._config.get(*args, **kwargs)
+    def __getitem__(self, key):
+        return getattr(self, key)
 
-
-def _walk_object(obj, callback):
-    if not hasattr(obj, '__iter__'):
-        return callback(obj)
-    obj_new = {}
-    if isinstance(obj, dict):
-        for i, value in obj.iteritems():
-            value = _walk_object(value, callback)
-            if value or value == '':
-                obj_new[i] = value
-        return obj_new
-    for i, value in enumerate(obj):
-        value = _walk_object(value, callback)
-        if value or value == '':
-            obj_new[i] = value
-    return obj_new
-
-
-def convert_env_vars(config):
-    def _replace_env(s):
-        if isinstance(s, basestring) and s.startswith('_env:'):
-            parts = s.split(':', 2)
-            varname = parts[1]
-            vardefault = None if len(parts) < 3 else parts[2]
-            return os.environ.get(varname, vardefault)
-        return s
-
-    return _walk_object(config, _replace_env)
+    def __contains__(self, key):
+        return key in self._config
 
 
-_config = None
-
-
-def load():
-    global _config
-    if _config is not None:
-        return _config
-    data = None
+def _init():
+    flavor = os.environ.get('SETTINGS_FLAVOR', 'dev')
     config_path = os.environ.get('DOCKER_REGISTRY_CONFIG', 'config.yml')
+
     if not os.path.isabs(config_path):
         config_path = os.path.join(os.path.dirname(__file__), '../../',
                                    'config', config_path)
     try:
         f = open(config_path)
     except Exception:
-        raise FileNotFoundError(
+        raise exceptions.FileNotFoundError(
             'Heads-up! File is missing: %s' % config_path)
 
-    try:
-        data = yaml.load(f)
-    except Exception:
-        raise ConfigError(
-            'Config file (%s) is not valid yaml' % config_path)
+    conf = Config(f.read())
+    if flavor:
+        if flavor not in conf:
+            raise exceptions.ConfigError(
+                'The specified flavor (%s) is missing in your config file (%s)'
+                % (flavor, config_path))
+        conf = conf[flavor]
+        conf.flavor = flavor
 
-    config = data.get('common', {})
-    flavor = os.environ.get('SETTINGS_FLAVOR', 'dev')
-    config.update(data.get(flavor, {}))
-    config['flavor'] = flavor
-    config = convert_env_vars(config)
-    if 'privileged_key' in config:
+    if conf.privileged_key:
         try:
-            f = open(config['privileged_key'])
+            f = open(conf.privileged_key)
         except Exception:
-            raise FileNotFoundError(
-                'Heads-up! File is missing: %s' % config['privileged_key'])
+            raise exceptions.FileNotFoundError(
+                'Heads-up! File is missing: %s' % conf.privileged_key)
 
         try:
-            config['privileged_key'] = rsa.PublicKey.load_pkcs1(f.read())
+            pk = f.read().split('\n')
+            pk = 'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A' + ''.join(pk[1:-2])
+            pk = [pk[i: i + 64] for i in range(0, len(pk), 64)]
+            pk = ('-----BEGIN PUBLIC KEY-----\n' + '\n'.join(pk) +
+                  '\n-----END PUBLIC KEY-----')
+            bio = BIO.MemoryBuffer(pk)
+            conf.privileged_key = RSA.load_pub_key_bio(bio)
         except Exception:
-            raise ConfigError(
-                'Key at %s is not a valid RSA key' % config['privileged_key'])
+            raise exceptions.ConfigError(
+                'Key at %s is not a valid RSA key' % conf.privileged_key)
+        f.close()
 
-    _config = Config(config)
+    if conf.index_endpoint:
+        conf.index_endpoint = conf.index_endpoint.strip('/')
+
+    return conf
+
+_config = None
+
+
+def load():
+    global _config
+
+    if not _config:
+        _config = _init()
+
     return _config

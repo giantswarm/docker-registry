@@ -5,7 +5,6 @@
 *.db
 .DS_Store
 .idea
-.dotcloud
 .coverage
 .tox
 htmlcov
@@ -23,3 +22,8 @@ eggs
 
 Vagrantfile
 .vagrant
+
+*tmp
+
+*.sublime-workspace
+*.sublime-project

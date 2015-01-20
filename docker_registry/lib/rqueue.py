@@ -1,12 +1,12 @@
+# -*- coding: utf-8 -*-
+
 # this module is a slight modification of Ted Nyman's QR
 # https://raw.github.com/tnm/qr/master/qr.py
 
 import logging
 
-try:
-    import json
-except ImportError:
-    import simplejson as json
+from docker_registry.core import compat
+json = compat.json
 
 
 class NullHandler(logging.Handler):
@@ -137,6 +137,7 @@ class BaseQueue(object):
 
 class CappedCollection(BaseQueue):
     """a bounded queue
+
     Implements a capped collection (the collection never
     gets larger than the specified size).
     """

@@ -1,12 +1,20 @@
-import tarfile
+# -*- coding: utf-8 -*-
+
+import logging
 import tempfile
 
 import backports.lzma as lzma
-import simplejson as json
+
+from docker_registry.core import compat
+json = compat.json
 
 from .. import storage
 from . import cache
 from . import rqueue
+# this is our monkey patched snippet from python v2.7.6 'tarfile'
+# with xattr support
+from .xtarfile import tarfile
+
 
 store = storage.load()
 
@@ -25,8 +33,18 @@ FILE_TYPES = {
     tarfile.GNUTYPE_SPARSE: 'S',
 }
 
+logger = logging.getLogger(__name__)
+
 # queue for requesting diff calculations from workers
 diff_queue = rqueue.CappedCollection(cache.redis_conn, "diff-worker", 1024)
+
+
+def enqueue_diff(image_id):
+    try:
+        if cache.redis_conn:
+            diff_queue.push(image_id)
+    except cache.redis.exceptions.ConnectionError as e:
+        logger.warning("Diff queue: Redis connection error: {0}".format(e))
 
 
 def generate_ancestry(image_id, parent_id=None):
@@ -34,17 +52,20 @@ def generate_ancestry(image_id, parent_id=None):
         store.put_content(store.image_ancestry_path(image_id),
                           json.dumps([image_id]))
         return
-    data = store.get_content(store.image_ancestry_path(parent_id))
-    data = json.loads(data)
+    # Note(dmp): unicode patch
+    data = store.get_json(store.image_ancestry_path(parent_id))
     data.insert(0, image_id)
-    store.put_content(store.image_ancestry_path(image_id), json.dumps(data))
+    # Note(dmp): unicode patch
+    store.put_json(store.image_ancestry_path(image_id), data)
 
 
 class Archive(lzma.LZMAFile):
     """file-object wrapper for decompressing xz compressed tar archives
+
     This class wraps a file-object that contains tar archive data. The data
     will be optionally decompressed with lzma/xz if found to be a compressed
     archive.
+    The file-object itself must be seekable.
     """
 
     def __init__(self, *args, **kwargs):
@@ -55,9 +76,11 @@ class Archive(lzma.LZMAFile):
         if not self.compressed:
             return getattr(self._fp, method)(*args, **kwargs)
         if self.compressed:
+            previous = self._fp.tell()
             try:
                 return getattr(super(Archive, self), method)(*args, **kwargs)
             except lzma._lzma.LZMAError:
+                self._fp.seek(previous)
                 self.compressed = False
                 return getattr(self._fp, method)(*args, **kwargs)
 
@@ -99,6 +122,7 @@ class TarFilesInfo(object):
 
 def serialize_tar_info(tar_info):
     '''serialize a tarfile.TarInfo instance
+
     Take a single tarfile.TarInfo instance and serialize it to a
     tuple. Consider union whiteouts by filename and mark them as
     deleted in the third element. Don't include union metadata
@@ -169,6 +193,7 @@ def get_image_files_from_fobj(layer_file):
 
 def get_image_files_json(image_id):
     '''return json file listing for given image id
+
     Download the specified layer and determine the file contents.
     Alternatively, process a passed in file-object containing the
     layer data.
@@ -191,6 +216,7 @@ def get_image_files_json(image_id):
 
 def get_file_info_map(file_infos):
     '''convert a list of file info tuples to dictionaries
+
     Convert a list of layer file info tuples to a dictionary using the
     first element (filename) as the key.
     '''
@@ -210,6 +236,7 @@ def set_image_diff_cache(image_id, diff_json):
 
 def get_image_diff_json(image_id):
     '''get json describing file differences in layer
+
     Calculate the diff information for the files contained within
     the layer. Return a dictionary of lists grouped by whether they
     were deleted, changed or created in this layer.
@@ -233,8 +260,10 @@ def get_image_diff_json(image_id):
 
     # we need all ancestral layers to calculate the diff
     ancestry_path = store.image_ancestry_path(image_id)
-    ancestry = json.loads(store.get_content(ancestry_path))[1:]
+    # Note(dmp): unicode patch
+    ancestry = store.get_json(ancestry_path)[1:]
     # grab the files from the layer
+    # Note(dmp): unicode patch NOT applied - implications not clear
     files = json.loads(get_image_files_json(image_id))
     # convert to a dictionary by filename
     info_map = get_file_info_map(files)
@@ -246,6 +275,7 @@ def get_image_diff_json(image_id):
     # walk backwards in time by iterating the ancestry
     for id in ancestry:
         # get the files from the current ancestor
+        # Note(dmp): unicode patch NOT applied - implications not clear
         ancestor_files = json.loads(get_image_files_json(id))
         # convert to a dictionary of the files mapped by filename
         ancestor_map = get_file_info_map(ancestor_files)
