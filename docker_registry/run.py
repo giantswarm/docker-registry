@@ -26,6 +26,7 @@ GUNICORN_USER: unix user to downgrade priviledges to
 GUNICORN_GROUP: unix group to downgrade priviledges to
 GUNICORN_ACCESS_LOG_FILE: File to log access to
 GUNICORN_ERROR_LOG_FILE: File to log errors to
+GUNICORN_MAX_REQUESTS: The maximum number of requests a worker will process before restarting
 GUNICORN_OPTS: extra options to pass to gunicorn
 """
 
@@ -57,7 +58,7 @@ def run_gunicorn():
         gunicorn_path, 'gunicorn',
         '--access-logfile', env.source('GUNICORN_ACCESS_LOG_FILE'),
         '--error-logfile', env.source('GUNICORN_ERROR_LOG_FILE'),
-        '--max-requests', '100',
+        '--max-requests', env.source('GUNICORN_MAX_REQUESTS'),
         '-k', 'gevent',
         '--graceful-timeout', env.source('GUNICORN_GRACEFUL_TIMEOUT'),
         '-t', env.source('GUNICORN_SILENT_TIMEOUT'),
